@@ -18,7 +18,7 @@ SCHEMA = {
     "type": "object",
     "required": ["doc2ml_version", "document_id", "metadata", "structure", "blocks", "cross_references", "ml_index"],
     "properties": {
-        "doc2ml_version": {"type": "string", "enum": ["0.5.0"]},
+        "doc2ml_version": {"type": "string", "enum": ["0.6.2"]},
         "document_id": {"type": "string"},
         "metadata": {
             "type": "object",
