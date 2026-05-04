@@ -3,7 +3,7 @@
 Main extraction pipeline for doc2ml-json.
 
 Converts any supported document (PDF, EPUB, DOCX, TXT, MD, HTML) into
-structured JSON following the doc2ml-json schema v0.5.0.
+structured JSON following the doc2ml-json schema v0.6.2.
 """
 
 import argparse
@@ -45,6 +45,12 @@ try:
     from lxml import etree
 except ImportError:
     etree = None
+try:
+    import pytesseract
+    from pdf2image import convert_from_path
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
 
 
 def sha256_file(filepath: str) -> str:
@@ -87,6 +93,9 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(len(text.split()) * 0.75))
 
 
+EXCLUDED_KEYS = {"wikipedia", "see", "arxiv", "http", "https", "doi", "ref", "source"}
+
+
 def extract_key_values(text: str) -> dict:
     """Heuristic key-value extraction for patterns like 'Key: Value' or 'Key → Value'.
     Returns a dict only when >1 lines in the text match the pattern."""
@@ -99,9 +108,66 @@ def extract_key_values(text: str) -> dict:
         if m:
             key = m.group(1).strip()
             val = m.group(2).strip()
-            if key and val:
-                kvs[key] = val
+            if not key or not val:
+                continue
+            key_lower = key.lower()
+            if key_lower in EXCLUDED_KEYS:
+                continue
+            if "wikipedia:" in val.lower() or "arxiv:" in val.lower():
+                continue
+            if any(kw in key_lower for kw in (".com", ".org", ".net", "http")):
+                continue
+            kvs[key] = val
     return kvs if len(kvs) > 1 else {}
+
+
+def _extract_cross_references_from_blocks(blocks: list[dict]) -> list[dict]:
+    """Scan all block text for cross-references (URLs, arXiv, DOI, Wikipedia, emails)."""
+    patterns = [
+        ("url", r'https?://[^\s<>"\')\]]+'),
+        ("arxiv", r'ar[Xx]iv:\d{4}\.\d{4,5}(?:v\d+)?'),
+        ("doi", r'10\.\d{4,}/[^\s]+'),
+        ("wikipedia", r'[Ww]ikipedia:[^\s]+'),
+        ("email", r'[\w.-]+@[\w.-]+\.\w+'),
+    ]
+    refs = []
+    seen = set()
+    for b in blocks:
+        text = b.get("text_plain", "")
+        if not text:
+            continue
+        for ref_type, pattern in patterns:
+            for m in re.finditer(pattern, text):
+                matched = m.group(0)
+                # Trim trailing punctuation likely not part of the reference
+                matched = matched.rstrip(".,;:!?)")
+                if matched in seen:
+                    continue
+                seen.add(matched)
+                refs.append({
+                    "type": ref_type,
+                    "target": matched,
+                    "context": text[max(0, m.start() - 30):m.end() + 30],
+                    "source_chunk_id": b.get("chunk_id"),
+                })
+    return refs
+
+
+def _extract_dates_from_text(text: str) -> list[str]:
+    """Extract dates from text and return ISO 8601 formatted dates."""
+    month_names = "January|February|March|April|May|June|July|August|September|October|November|December"
+    pattern = rf'\b({month_names})\s+(\d{{1,2}}),?\s+(\d{{4}})\b'
+    matches = re.finditer(pattern, text, re.IGNORECASE)
+    dates = []
+    month_map = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+        'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12
+    }
+    for m in matches:
+        month_str, day, year = m.group(1), int(m.group(2)), int(m.group(3))
+        month_num = month_map[month_str.lower()]
+        dates.append(f"{year:04d}-{month_num:02d}-{day:02d}")
+    return dates
 
 
 def clean_url(url: str, base_url: str | None = None) -> str:
@@ -187,6 +253,171 @@ def detect_format(filepath: str) -> str:
     return "text/plain"
 
 
+def _estimate_heading_level_from_text(text: str) -> int:
+    """Estimate heading level from text characteristics.
+
+    Returns 1-6 heading level based on formatting heuristics.
+    """
+    if not text:
+        return 2
+    if text.isupper() and len(text) < 40:
+        return 1
+    if text.isupper() and len(text) < 60:
+        return 2
+    # Numbered patterns: "1." -> level 1, "1.1." -> level 2, "1.1.1" -> level 3
+    m = re.match(r'^(\d+(?:\.\d+)*)', text)
+    if m:
+        depth = m.group(1).count('.') + 1
+        return min(depth, 6)
+    if len(text.split()) <= 3:
+        return 3
+    return 2
+
+
+def _split_page_into_blocks(page_text: str, page_number: int, base_block_idx: int = 0) -> list[dict]:
+    """Split a page of text into multiple structured blocks.
+
+    Returns list of dicts with keys: type, text, page_number, and optionally
+    level (for headings), ordered/indent (for list_items).
+    """
+    blocks = []
+    lines = page_text.split('\n')
+    current_paragraph = []
+
+    def flush_paragraph():
+        if current_paragraph:
+            text = ' '.join(current_paragraph).strip()
+            if text:
+                blocks.append({'type': 'paragraph', 'text': text, 'page_number': page_number})
+            current_paragraph.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            flush_paragraph()
+            continue
+
+        # Heading detection
+        # Pattern 1: Numbered section ("1. Title", "1.1 Subtitle", "2.1.1 Deep")
+        if re.match(r'^\d+(\.\d+)*\.?\s+\S', stripped) and len(stripped) < 120:
+            # Exclude time/data conversion patterns ("1 kilosecond: 16.7 minutes", "1 Earth day: 86.4 ks")
+            if re.search(r'^\d+\s+(\w+|\w+\s+\w+):\s*\d', stripped):
+                pass  # fall through to paragraph
+            else:
+                flush_paragraph()
+                blocks.append({
+                    'type': 'heading',
+                    'text': stripped,
+                    'page_number': page_number,
+                    'level': _estimate_heading_level_from_text(stripped),
+                })
+                continue
+
+        # Pattern 2: Short all-caps line (potential heading)
+        if stripped.isupper() and len(stripped) < 80 and len(stripped) > 3:
+            # Exclude short labels ending with colon (e.g. "CCAA:")
+            if stripped.endswith(':'):
+                pass  # fall through to paragraph
+            else:
+                flush_paragraph()
+                blocks.append({
+                    'type': 'heading',
+                    'text': stripped,
+                    'page_number': page_number,
+                    'level': _estimate_heading_level_from_text(stripped),
+                })
+                continue
+
+        # Pattern 3: Short line, no sentence-ending punctuation (potential heading)
+        # Must NOT look like a list item (exclude bullets and numbered items)
+        if (len(stripped) < 80 and not any(c in stripped for c in '.!?;')
+                and len(stripped.split()) <= 8
+                and not re.match(r'^[\-\u2022*\u00b7\u25e6\u25cb\d]', stripped)):
+            lower = stripped.lower()
+            words = stripped.split()
+            skip = False
+            # Skip citation markers (See:, Source:, Note:)
+            if re.match(r'^(See|Source|Note|Ref|Also)\s*:', stripped, re.IGNORECASE):
+                skip = True
+            elif any(tag in lower for tag in ['wikipedia:', 'arxiv:', 'doi:', 'http://', 'https://']):
+                skip = True
+            elif lower == 'edit':
+                skip = True
+            elif stripped.endswith(':') and len(words) <= 3:
+                skip = True
+            elif len(words) == 1 and not any(c.isalnum() for c in words[0]):
+                skip = True
+            elif re.match(r'^\d+\s+\w+:\s*\d', stripped):
+                skip = True
+            elif len(words) >= 2 and words[1].startswith(':') and len(words[0]) > 2:
+                skip = True
+            if not skip:
+                flush_paragraph()
+                blocks.append({
+                    'type': 'heading',
+                    'text': stripped,
+                    'page_number': page_number,
+                    'level': _estimate_heading_level_from_text(stripped),
+                })
+                continue
+
+        # List detection
+        list_match = re.match(r'^(\s*)([-\u2022*\u00b7\u25e6\u25cb]\s+|\d+[.)]\s+)(.*)', stripped)
+        if list_match:
+            flush_paragraph()
+            blocks.append({
+                'type': 'list_item',
+                'text': list_match.group(3).strip(),
+                'page_number': page_number,
+                'ordered': bool(re.match(r'^\d', list_match.group(2).strip())),
+                'indent': len(list_match.group(1)),
+            })
+            continue
+
+        # Glossary / definition list detection
+        def_match = re.match(r'^([A-Za-z][A-Za-z\s\-]{1,30}):\s*(.+)', stripped)
+        if def_match and len(def_match.group(1).split()) <= 4:
+            term = def_match.group(1).strip()
+            definition = def_match.group(2).strip()
+            if not re.match(r'^\d+\s+\w+', term) and 'http' not in definition[:10]:
+                flush_paragraph()
+                blocks.append({
+                    'type': 'definition_list',
+                    'term': term,
+                    'definition': definition,
+                    'text': stripped,
+                    'page_number': page_number,
+                })
+                continue
+
+        current_paragraph.append(stripped)
+
+    flush_paragraph()
+
+    # Post-process: merge consecutive short headings that form a split title
+    merged_blocks = []
+    i = 0
+    while i < len(blocks):
+        blk = blocks[i]
+        if (blk['type'] == 'heading' and i + 1 < len(blocks)
+                and blocks[i + 1]['type'] == 'heading'
+                and len(blk['text']) < 40
+                and len(blocks[i + 1]['text']) < 40
+                and not any(c in blk['text'][-1] for c in '.!?;')):
+            merged_text = blk['text'] + ' ' + blocks[i + 1]['text']
+            merged_blocks.append({
+                'type': 'heading',
+                'text': merged_text,
+                'page_number': blk['page_number'],
+                'level': blk.get('level', 2),
+            })
+            i += 2
+        else:
+            merged_blocks.append(blk)
+            i += 1
+    return merged_blocks
+
+
 # ---------------------------------------------------------------------------
 # PDF extraction
 # ---------------------------------------------------------------------------
@@ -220,23 +451,205 @@ def extract_pdf(filepath: str) -> dict:
             pass
     if not pages_data:
         return {"blocks": [], "metadata": metadata, "pages": 0}
-    blocks = []
+
+    # Structure inference: split each page into multiple logical blocks
+    structured_blocks = []
     for p in pages_data:
-        raw = normalize_whitespace(normalize_unicode(p["raw_text"]))
-        if raw:
-            blk = make_block_base(f"blk-{len(blocks):03d}", "paragraph", raw, p["page_number"],
-                                  "page text", "pdfplumber" if pdfplumber else "pymupdf", 0.92)
-            blocks.append(blk)
+        page_text = normalize_whitespace(normalize_unicode(p["raw_text"]))
+        if page_text:
+            split_blocks = _split_page_into_blocks(page_text, p["page_number"], len(structured_blocks))
+            structured_blocks.extend(split_blocks)
+        # Add tables as raw blocks for build_structure_and_blocks() to process
         for t in p.get("tables", []):
             if t:
-                md_rows = ["| " + " | ".join(str(c or "") for c in row) + " |" for row in t if row]
-                md = "\n".join(md_rows)
-                tbl_text = "Table\n" + md
-                blk = make_block_base(f"blk-{len(blocks):03d}", "table", tbl_text, p["page_number"],
-                                      "table region", "pdfplumber", 0.88)
-                blk["content"] = {"rows": t, "row_count": len(t), "column_count": max(len(r) for r in t) if t else 0}
-                blocks.append(blk)
-    return {"blocks": blocks, "metadata": metadata, "pages": len(pages_data)}
+                table_lines = []
+                for row in t:
+                    cleaned = [str(cell or "").replace("\n", " ").strip() for cell in row]
+                    table_lines.append(" | ".join(cleaned))
+                table_text = "\n".join(table_lines)
+                structured_blocks.append({
+                    "type": "table",
+                    "rows": t,
+                    "text": table_text,
+                    "page_number": p["page_number"],
+                })
+
+    # Build raw blocks from structured blocks for downstream processing
+    raw_blocks = []
+    for i, blk in enumerate(structured_blocks):
+        raw_block = {
+            "page_number": blk["page_number"],
+            "type": blk["type"],
+            "text": blk.get("text", ""),
+        }
+        # Pass through definition list metadata
+        if blk.get("term") is not None:
+            raw_block["term"] = blk["term"]
+        if blk.get("definition") is not None:
+            raw_block["definition"] = blk["definition"]
+        # Pass through heading level if present
+        if blk.get("level") is not None:
+            raw_block["level"] = blk["level"]
+        # Pass through list item metadata
+        if blk.get("ordered") is not None:
+            raw_block["ordered"] = blk["ordered"]
+        raw_blocks.append(raw_block)
+
+    # OCR fallback for scanned/image-based PDFs
+    if not pages_data or all(not p["raw_text"].strip() for p in pages_data):
+        ocr_result = extract_pdf_ocr(filepath)
+        if ocr_result["ocr_info"].get("used"):
+            return ocr_result
+    return {"blocks": raw_blocks, "metadata": metadata, "pages": len(pages_data)}
+
+
+def extract_pdf_ocr(filepath: str, dpi: int = 200, max_pages: int = 0) -> dict:
+    """OCR fallback for scanned/image-based PDFs using Tesseract.
+    
+    Args:
+        filepath: Path to PDF file
+        dpi: Resolution for PDF-to-image conversion (default 200)
+        max_pages: Max pages to OCR (0 = all pages). Large PDFs may be slow.
+    
+    Returns:
+        dict with blocks, metadata, pages, and ocr_info
+    """
+    if not OCR_AVAILABLE:
+        return {"blocks": [], "metadata": {}, "pages": 0, "ocr_info": {"used": False, "reason": "OCR libraries not installed"}}
+    
+    blocks = []
+    metadata = {}
+    ocr_info = {"used": True, "engine": "tesseract", "version": "", "dpi": dpi, "max_pages": max_pages, "pages_ocred": 0}
+    
+    try:
+        ocr_info["version"] = str(pytesseract.get_tesseract_version())
+    except Exception:
+        pass
+    
+    try:
+        # Convert PDF pages to images
+        kwargs = {"dpi": dpi, "fmt": "png"}
+        if max_pages > 0:
+            kwargs["first_page"] = 1
+            kwargs["last_page"] = max_pages
+        
+        images = convert_from_path(filepath, **kwargs)
+        total_pages = len(images)
+        
+        for i, image in enumerate(images, start=1):
+            # Run OCR on each page
+            page_text = pytesseract.image_to_string(image, lang="eng")
+            page_text = normalize_whitespace(normalize_unicode(page_text))
+            
+            if page_text.strip():
+                # Try to infer structure from OCR text
+                page_blocks = _infer_structure_from_ocr(page_text, page_number=i)
+                blocks.extend(page_blocks)
+            
+            ocr_info["pages_ocred"] = i
+        
+        metadata["_ocr"] = ocr_info
+        return {"blocks": blocks, "metadata": metadata, "pages": total_pages, "ocr_info": ocr_info}
+    
+    except Exception as e:
+        ocr_info["used"] = False
+        ocr_info["reason"] = str(e)
+        metadata["_ocr_error"] = str(e)
+        return {"blocks": [], "metadata": metadata, "pages": 0, "ocr_info": ocr_info}
+
+
+def _infer_structure_from_ocr(text: str, page_number: int) -> list:
+    """Infer document structure from raw OCR text."""
+    lines = text.split("\n")
+    blocks = []
+    current_para = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current_para:
+                para_text = " ".join(current_para)
+                # Check if it looks like a heading
+                if _looks_like_heading(para_text):
+                    level = _estimate_heading_level(para_text)
+                    blocks.append({
+                        "type": "heading",
+                        "text": para_text,
+                        "level": level,
+                        "source_location": "ocr inferred",
+                        "confidence": 0.75,
+                    })
+                else:
+                    blocks.append({
+                        "type": "paragraph",
+                        "text": para_text,
+                        "source_location": "ocr inferred",
+                        "confidence": 0.80,
+                    })
+                current_para = []
+            continue
+        
+        # Check for list items
+        list_match = re.match(r"^(\s*)([-*•]|\d+[.):])\s+(.*)", stripped)
+        if list_match and not current_para:
+            items = [{"text": list_match.group(3), "level": len(list_match.group(1)) // 2}]
+            blocks.append({
+                "type": "list",
+                "ordered": list_match.group(2)[0].isdigit(),
+                "items": items,
+                "source_location": "ocr inferred",
+                "confidence": 0.75,
+            })
+            continue
+        
+        current_para.append(stripped)
+    
+    # Flush remaining paragraph
+    if current_para:
+        para_text = " ".join(current_para)
+        if _looks_like_heading(para_text):
+            level = _estimate_heading_level(para_text)
+            blocks.append({
+                "type": "heading",
+                "text": para_text,
+                "level": level,
+                "source_location": "ocr inferred",
+                "confidence": 0.75,
+            })
+        else:
+            blocks.append({
+                "type": "paragraph",
+                "text": para_text,
+                "source_location": "ocr inferred",
+                "confidence": 0.80,
+            })
+    
+    return blocks
+
+
+def _looks_like_heading(text: str) -> bool:
+    """Heuristic: does this text look like a heading?"""
+    if not text:
+        return False
+    # Short text, mostly uppercase, or no sentence-ending punctuation
+    words = text.split()
+    if len(words) <= 6 and len(text) < 80:
+        if text.isupper():
+            return True
+        if not any(c in text for c in ".!?;"):
+            return True
+    return False
+
+
+def _estimate_heading_level(text: str) -> int:
+    """Estimate heading level from text characteristics."""
+    if text.isupper() and len(text) < 40:
+        return 1
+    if text.isupper() and len(text) < 60:
+        return 2
+    if len(text.split()) <= 3:
+        return 3
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1444,12 @@ def build_structure_and_blocks(raw_blocks: list[dict], source_info: dict) -> tup
     for idx, rb in enumerate(raw_blocks):
         chunk_id = f"blk-{idx:03d}"
         btype = rb.get("type", "paragraph")
+        # Convert list_item type to paragraph (structure detected but stored as paragraph)
+        if btype in ("list_item",):
+            btype = "paragraph"
+        # Keep definition_list as-is for special handling below
+        if btype == "definition_list":
+            pass
         text = rb.get("text_plain", rb.get("text", ""))
         text_original = rb.get("text_original", rb.get("text_plain", rb.get("text", ""))) or text
         if btype == "table":
@@ -1050,13 +1469,15 @@ def build_structure_and_blocks(raw_blocks: list[dict], source_info: dict) -> tup
             text = "---"
         elif btype == "image_placeholder":
             text = rb.get("alt", "") or rb.get("src", "")
-        b = make_block_base(chunk_id, btype, text, source_info.get("page"), rb.get("source_location", ""),
+        page_num = rb.get("page_number") or rb.get("page")
+        b = make_block_base(chunk_id, btype, text, page_num, rb.get("source_location", ""),
                             source_info.get("extractor", ""), rb.get("confidence", 0.95))
         b["text_original"] = text_original if text_original else text
         if btype == "heading":
-            b["content"] = {"text": text, "level": rb.get("level", 1), "numbered": False, "label": None}
-            b["semantics"]["heading_level"] = rb.get("level", 1)
-            headings.append({"chunk_id": chunk_id, "level": rb.get("level", 1), "text": text})
+            level = rb.get("level") or _estimate_heading_level_from_text(text)
+            b["content"] = {"text": text, "level": level, "numbered": False, "label": None}
+            b["semantics"]["heading_level"] = level
+            headings.append({"chunk_id": chunk_id, "level": level, "text": text})
         elif btype == "paragraph":
             b["content"] = {"text": text, "inline_elements": [], "sentences": []}
             kvs = extract_key_values(text)
@@ -1089,6 +1510,12 @@ def build_structure_and_blocks(raw_blocks: list[dict], source_info: dict) -> tup
                 "row_count": len(data_rows),
                 "header_row_count": 1 if headers else 0,
                 "column_count": max(len(r) for r in rows) if rows else 0,
+            }
+        elif btype == "definition_list":
+            b["content"] = {
+                "term": rb.get("term", ""),
+                "definition": rb.get("definition", ""),
+                "items": [{"term": rb.get("term", ""), "definition": rb.get("definition", "")}],
             }
         elif btype == "quote":
             b["content"] = {"text": text, "attribution": None, "source": None, "cite_chunk_id": None}
@@ -1267,7 +1694,7 @@ def extract_document(filepath: str) -> dict:
     size = os.path.getsize(filepath)
     doc_id = str(uuid.uuid4())
     extractor = "doc2ml-json"
-    extractor_version = "0.5.0"
+    extractor_version = "0.6.2"
     pipeline_steps = ["detect", "extract", "normalize", "structure", "index"]
     raw_blocks = []
     meta_extra = {}
@@ -1278,6 +1705,10 @@ def extract_document(filepath: str) -> dict:
         meta_extra = result.get("metadata", {})
         page_count = result.get("pages", 0)
         extractor = "pdfplumber" if pdfplumber else "pymupdf"
+        if "ocr_info" in result:
+            meta_extra["_ocr_info"] = result["ocr_info"]
+            if result["ocr_info"].get("used"):
+                extractor = f"{extractor}+tesseract_ocr"
     elif mime == "application/epub+zip":
         result = extract_epub(filepath)
         chapters = result.get("chapters", [])
@@ -1340,6 +1771,11 @@ def extract_document(filepath: str) -> dict:
     blocks, structure = build_structure_and_blocks(raw_blocks, source_info)
     # Update parent heading and structure refs after tree built
     ml_index = build_ml_index(blocks, structure)
+    # Extract cross-references from all block text
+    cross_references = _extract_cross_references_from_blocks(blocks)
+    # Extract dates from first 5000 chars of block text for metadata
+    combined_text = " ".join(b.get("text_plain", "") for b in blocks)
+    extracted_dates = _extract_dates_from_text(combined_text[:5000])
     # Compute stats
     char_count = sum(b["char_count"] for b in blocks)
     tok_count = sum(b["token_count_est"] for b in blocks)
@@ -1350,7 +1786,7 @@ def extract_document(filepath: str) -> dict:
     fn_count = sum(1 for b in blocks if b["type"] == "footnote")
     duration = int((time.time() - start) * 1000)
     doc = {
-        "doc2ml_version": "0.5.0",
+        "doc2ml_version": "0.6.2",
         "document_id": doc_id,
         "metadata": {
             "title": meta_extra.get("title") or meta_extra.get("Title") or filename,
@@ -1367,7 +1803,7 @@ def extract_document(filepath: str) -> dict:
             },
             "ingestion": {
                 "ingestion_date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "processing_version": "doc2ml-json v0.5.0",
+                "processing_version": "doc2ml-json v0.6.2",
                 "extractor": extractor,
                 "extractor_version": extractor_version,
                 "ingestion_pipeline": pipeline_steps,
@@ -1392,12 +1828,14 @@ def extract_document(filepath: str) -> dict:
             },
             "classification": {"doc_type": "unknown", "genre": None, "keywords": [], "topics_ml": []},
             "dates": {"created": meta_extra.get("created") or meta_extra.get("date"),
-                      "modified": meta_extra.get("modified"), "published": meta_extra.get("published")},
+                      "modified": meta_extra.get("modified"),
+                      "published": meta_extra.get("published") or (extracted_dates[0] if extracted_dates else None)},
             "rights": {"license": None, "copyright": None, "open_access": True},
+            "_ocr_info": meta_extra.get("_ocr_info"),
         },
         "structure": structure,
         "blocks": blocks,
-        "cross_references": [],
+        "cross_references": cross_references,
         "ml_index": ml_index,
         "custom": {},
     }
