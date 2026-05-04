@@ -54,19 +54,20 @@ For PDFs specifically, check if scanned: open with `fitz` (PyMuPDF), if `page.ge
 
 Route by detected format. Use these libraries:
 
-| Format | Primary Library                 | Fallback               | Key Extraction Target                            |
-| ------ | ------------------------------- | ---------------------- | ------------------------------------------------ |
-| PDF    | `pdfplumber` + `fitz` (PyMuPDF) | `PyPDF2`               | Text blocks with bbox, tables, metadata          |
-| EPUB   | `ebooklib` + `BeautifulSoup`    | Manual ZIP + XML       | Spine reading order, chapter HTML, TOC           |
-| DOCX   | `python-docx` + `lxml`          | `zipfile` + manual XML | Paragraphs, tables, lists, styles, footnotes     |
-| TXT/MD | Native Python + `markdown`      | `yaml` for frontmatter | Headings, paragraphs, code blocks, lists, tables |
-| HTML   | `BeautifulSoup`                 | `lxml`                 | Semantic tags, heading hierarchy, links          |
+| Format | Primary Library | Fallback | Key Extraction Target |
+|--------|-----------------|----------|----------------------|
+| PDF | `pdfplumber` + `fitz` (PyMuPDF) | `pytesseract` + `pdf2image` for scanned PDFs | Text blocks with bbox, tables, metadata |
+| EPUB | `ebooklib` + `BeautifulSoup` | Manual ZIP + XML | Spine reading order, chapter HTML, TOC |
+| DOCX | `python-docx` + `lxml` | `zipfile` + manual XML | Paragraphs, tables, lists, styles, footnotes |
+| TXT/MD | Native Python + `markdown` | `yaml` for frontmatter | Headings, paragraphs, code blocks, lists, tables |
+| HTML | `BeautifulSoup` | `lxml` | Semantic tags, heading hierarchy, links |
 
 **PDF extraction details:**
 - Use `pdfplumber.open(filepath)` → iterate pages → `page.extract_words()` for layout, `page.extract_tables()` for tables
 - Use `fitz.open(filepath)` → `page.get_text("dict")` for font/size/style metadata, `doc.metadata` for document properties
 - Detect headings by font size: >1.3x average and <200 chars = heading; level by size tier relative to max
 - Remove headers/footers: collect text in top/bottom 10% margin across pages, drop lines appearing on >50% of pages
+- **OCR fallback**: If pdfplumber and PyMuPDF both return no text (scanned/image PDF), automatically fall back to Tesseract OCR via `pdf2image`. OCR is optional — if `pytesseract` or `pdf2image` are not installed, the fallback is skipped gracefully. Set `max_pages` limit for large scanned PDFs to avoid excessive processing time. OCR blocks receive confidence 0.75–0.80 vs 0.92 for text-based extraction.
 
 **EPUB extraction details:**
 - Open as ZIP → read `META-INF/container.xml` → find OPF path
@@ -176,16 +177,16 @@ When user requests specific content only:
 
 Derive task-specific training data from the canonical JSON:
 
-| Task                  | Strategy                                                                              | Source Fields                                       |
-| --------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| Instruction-following | Pair each heading with its section paragraphs as instruction → response               | `ml_index.heading_map` + section blocks             |
-| Summarization         | Abstract block as target, full body as input; or last paragraph per section as target | `abstract` blocks, `chunk_boundaries`               |
-| RAG retrieval         | Sliding-window chunks over `embedding_candidates` with overlap                        | `ml_index.embedding_candidates`, `context_window`   |
-| Embeddings            | One payload per `embedding_ready` block with metadata for vector DB filtering         | `text_plain`, `structure_path`, `section_role`      |
-| Table-to-text         | Table `records` + `caption` as input, nearest paragraph as target                     | `table` blocks, spatial proximity in `blocks` array |
-| Code LLM              | `code_block` content as output, preceding paragraph as instruction                    | `code_block` blocks, `context_window.prev_chunk_id` |
-| QA                    | Citation cross-references as pseudo-QA pairs                                          | `cross_references` with `ref_type=citation`         |
-| Classification        | Document-level metadata + block statistics as features                                | `metadata.classification`, `metadata.statistics`    |
+| Task | Strategy | Source Fields |
+|------|----------|---------------|
+| Instruction-following | Pair each heading with its section paragraphs as instruction → response | `ml_index.heading_map` + section blocks |
+| Summarization | Abstract block as target, full body as input; or last paragraph per section as target | `abstract` blocks, `chunk_boundaries` |
+| RAG retrieval | Sliding-window chunks over `embedding_candidates` with overlap | `ml_index.embedding_candidates`, `context_window` |
+| Embeddings | One payload per `embedding_ready` block with metadata for vector DB filtering | `text_plain`, `structure_path`, `section_role` |
+| Table-to-text | Table `records` + `caption` as input, nearest paragraph as target | `table` blocks, spatial proximity in `blocks` array |
+| Code LLM | `code_block` content as output, preceding paragraph as instruction | `code_block` blocks, `context_window.prev_chunk_id` |
+| QA | Citation cross-references as pseudo-QA pairs | `cross_references` with `ref_type=citation` |
+| Classification | Document-level metadata + block statistics as features | `metadata.classification`, `metadata.statistics` |
 
 Implementation: iterate over `blocks` or `ml_index` fields, transform to target format (Alpaca, ChatML, JSONL), write to task-specific output files.
 
@@ -193,21 +194,21 @@ Implementation: iterate over `blocks` or `ml_index` fields, transform to target 
 
 13 defined error codes with recovery strategies:
 
-| Code                                       | Severity | Recovery                                                 |
-| ------------------------------------------ | -------- | -------------------------------------------------------- |
-| `DETECT_001` Extension/signature mismatch  | Warning  | Use signature result, flag for review                    |
-| `DETECT_002` Unknown file format           | Error    | Try generic text extraction; fail if binary              |
-| `DETECT_003` Corrupted ZIP (DOCX/EPUB)     | Error    | Try to repair ZIP, extract readable parts with `zipfile` |
-| `EXTRACT_001` Password-protected PDF       | Error    | Report failure, request password                         |
-| `EXTRACT_002` Scanned PDF without OCR text | Warning  | Set `is_scanned=true`, note OCR recommendation           |
-| `EXTRACT_003` Missing fonts in PDF         | Warning  | Use raw text extraction fallback (`PyPDF2`)              |
-| `EXTRACT_004` Broken XML in DOCX           | Error    | Parse with `lxml` recovery mode (`recover=True`)         |
-| `EXTRACT_005` Encoding detection failure   | Warning  | Use UTF-8 with replacement characters                    |
-| `STRUCT_001` No headings detected          | Warning  | Infer from paragraph patterns (all-caps, short lines)    |
-| `STRUCT_002` Broken heading hierarchy      | Warning  | Normalize levels, insert inferred headings               |
-| `STRUCT_003` Table extraction failed       | Warning  | Emit table as `unknown` block with raw text              |
-| `NORM_001` Invalid date format             | Warning  | Keep original, set `normalized: null`                    |
-| `NORM_002` URL parse error                 | Warning  | Keep original URL, log warning                           |
+| Code | Severity | Recovery |
+|------|----------|----------|
+| `DETECT_001` Extension/signature mismatch | Warning | Use signature result, flag for review |
+| `DETECT_002` Unknown file format | Error | Try generic text extraction; fail if binary |
+| `DETECT_003` Corrupted ZIP (DOCX/EPUB) | Error | Try to repair ZIP, extract readable parts with `zipfile` |
+| `EXTRACT_001` Password-protected PDF | Error | Report failure, request password |
+| `EXTRACT_002` Scanned PDF without OCR text | Warning | Set `is_scanned=true`, note OCR recommendation |
+| `EXTRACT_003` Missing fonts in PDF | Warning | Use raw text extraction fallback (`PyPDF2`) |
+| `EXTRACT_004` Broken XML in DOCX | Error | Parse with `lxml` recovery mode (`recover=True`) |
+| `EXTRACT_005` Encoding detection failure | Warning | Use UTF-8 with replacement characters |
+| `STRUCT_001` No headings detected | Warning | Infer from paragraph patterns (all-caps, short lines) |
+| `STRUCT_002` Broken heading hierarchy | Warning | Normalize levels, insert inferred headings |
+| `STRUCT_003` Table extraction failed | Warning | Emit table as `unknown` block with raw text |
+| `NORM_001` Invalid date format | Warning | Keep original, set `normalized: null` |
+| `NORM_002` URL parse error | Warning | Keep original URL, log warning |
 
 Recovery principle: **progressive enhancement**. Extract what you can; never fail entirely if partial extraction is possible. Log all errors in `metadata.ingestion` under `warnings` or `errors` arrays.
 
@@ -217,13 +218,13 @@ Top-level structure:
 
 ```json
 {
-  "doc2ml_version": "0.5.0",
+  "doc2ml_version": "0.6.2",
   "document_id": "uuid-v4",
   "metadata": {
     "title": "string",
     "authors": [{"name": "string"}],
     "source": {"uri": "...", "mime_type": "...", "filename": "...", "checksum_sha256": "...", "file_size_bytes": 0},
-    "ingestion": {"ingestion_date": "ISO-8601", "processing_version": "doc2ml-json v0.5.0", "extractor": "...", "extractor_version": "...", "ingestion_pipeline": ["..."], "processing_duration_ms": 0},
+    "ingestion": {"ingestion_date": "ISO-8601", "processing_version": "doc2ml-json v0.6.2", "extractor": "...", "extractor_version": "...", "ingestion_pipeline": ["..."], "processing_duration_ms": 0},
     "language": {"detected": "en", "confidence": 0.97},
     "statistics": {"page_count": 0, "chapter_count": 0, "section_count": 0, "block_count": 0, "table_count": 0, "figure_count": 0, "footnote_count": 0, "total_char_count": 0, "total_token_count_est": 0, "total_word_count": 0},
     "classification": {"doc_type": "...", "genre": "...", "keywords": ["..."], "topics_ml": [{"label": "...", "score": 0.92}]},
