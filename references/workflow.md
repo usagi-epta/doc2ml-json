@@ -3621,7 +3621,7 @@ def doc2ml_json(filepath: str, output_path: str | None = None) -> dict:
             "source_file": filepath,
             "id": str(uuid.uuid4()),
             "extraction_timestamp": datetime.utcnow().isoformat(),
-            "processing_version": "0.5.0",
+            "processing_version": "0.6.2",
         },
         "content": {},
         "structure": {},
@@ -3828,4 +3828,4 @@ def safe_xml_parse(xml_bytes: bytes):
 
 *End of doc2ml-json Workflow Design Document*
 
-*Pre-Release Version: 0.5.0 | Last Updated: 05/2026*
+*Pre-Release Version: 0.6.2 | Last Updated: 05/2026*
