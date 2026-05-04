@@ -178,7 +178,7 @@ def main():
             doc = json.load(f)
         chunks = chunk_document(doc, args.max_tokens, args.overlap_tokens)
         out = {
-            "doc2ml_version": doc.get("doc2ml_version", "0.5.0"),
+            "doc2ml_version": doc.get("doc2ml_version", "0.6.2"),
             "document_id": doc.get("document_id"),
             "source": doc.get("metadata", {}).get("source", {}).get("uri"),
             "chunking_params": {"max_tokens": args.max_tokens, "overlap_tokens": args.overlap_tokens},
