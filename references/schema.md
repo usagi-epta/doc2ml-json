@@ -1,8 +1,8 @@
-# `doc2ml-json` Canonical Schema v0.5.0
+# `doc2ml-json` Canonical Schema v0.6.2
 
-**Status:** Production-Ready  
-**Version:** 0.5.0  
-**Date:** 2025-05-04  
+**Status:** Pre-Release  
+**Version:** 0.6.2  
+**Date:** 2026-05-04  
 **Purpose:** Universal document-to-ML JSON ingestion schema for fine-tuning, RAG, embeddings, and sequence modeling pipelines.
 
 ---
@@ -41,7 +41,7 @@ The top-level object is a **`Doc2MLDocument`**. It contains metadata, a structur
 
 ```json
 {
-  "doc2ml_version": "0.5.0",
+  "doc2ml_version": "0.6.2",
   "document_id": "uuid-v4",
   "metadata": { ...DocumentMetadata... },
   "structure": { ...DocumentStructure... },
@@ -75,7 +75,7 @@ The top-level object is a **`Doc2MLDocument`**. It contains metadata, a structur
   },
   "ingestion": {
     "ingestion_date": "ISO-8601 datetime",
-    "processing_version": "doc2ml-json v0.5.0",
+    "processing_version": "doc2ml-json v0.6.2",
     "extractor": "string — e.g. 'pypdfium2', 'pandoc', 'marker'",
     "extractor_version": "string",
     "ingestion_pipeline": ["step1", "step2"],
@@ -526,7 +526,7 @@ This example demonstrates a minimal but complete document: a short tech blog pos
 
 ```json
 {
-  "doc2ml_version": "0.5.0",
+  "doc2ml_version": "0.6.2",
   "document_id": "doc-7f3a9b2e-4c1d-4e5f-8a6b-2c3d4e5f6a7b",
   "metadata": {
     "title": "Understanding Vector Embeddings",
@@ -546,7 +546,7 @@ This example demonstrates a minimal but complete document: a short tech blog pos
     },
     "ingestion": {
       "ingestion_date": "2025-01-16T09:30:00Z",
-      "processing_version": "doc2ml-json v0.5.0",
+      "processing_version": "doc2ml-json v0.6.2",
       "extractor": "pandoc",
       "extractor_version": "3.1.11",
       "ingestion_pipeline": ["html_parse", "structure_infer", "block_split", "metadata_enrich"],
@@ -849,7 +849,7 @@ This example demonstrates a full academic paper with: abstract, multi-level head
 
 ```json
 {
-  "doc2ml_version": "0.5.0",
+  "doc2ml_version": "0.6.2",
   "document_id": "doc-8b4c2d1e-9a3f-4b5c-8d7e-1a2b3c4d5e6f",
   "metadata": {
     "title": "Attention Is All You Need",
@@ -873,7 +873,7 @@ This example demonstrates a full academic paper with: abstract, multi-level head
     },
     "ingestion": {
       "ingestion_date": "2025-01-16T10:00:00Z",
-      "processing_version": "doc2ml-json v0.5.0",
+      "processing_version": "doc2ml-json v0.6.2",
       "extractor": "marker",
       "extractor_version": "0.3.0",
       "ingestion_pipeline": ["pdf_extract", "structure_infer", "table_ocr", "reference_parse", "crossref_resolve", "block_split", "ml_index_build"],
@@ -1506,7 +1506,7 @@ This example demonstrates a book with front matter, multiple parts, chapters, an
 
 ```json
 {
-  "doc2ml_version": "0.5.0",
+  "doc2ml_version": "0.6.2",
   "document_id": "doc-1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d",
   "metadata": {
     "title": "The Structure of Scientific Revolutions",
@@ -1526,7 +1526,7 @@ This example demonstrates a book with front matter, multiple parts, chapters, an
     },
     "ingestion": {
       "ingestion_date": "2025-01-16T11:00:00Z",
-      "processing_version": "doc2ml-json v0.5.0",
+      "processing_version": "doc2ml-json v0.6.2",
       "extractor": "epub2text",
       "extractor_version": "2.1.0",
       "ingestion_pipeline": ["epub_unpack", "opf_parse", "ncx_nav", "html_chapter_extract", "structure_infer", "block_split", "ml_index_build"],
@@ -2329,14 +2329,14 @@ For programmatic validation, here is the JSON Schema that validates any `doc2ml-
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://doc2ml.dev/schema/v0.5.0.json",
+  "$id": "https://doc2ml.dev/schema/v0.6.2.json",
   "title": "Doc2MLDocument",
   "type": "object",
   "required": ["doc2ml_version", "document_id", "metadata", "structure", "blocks", "cross_references", "ml_index"],
   "properties": {
     "doc2ml_version": {
       "type": "string",
-      "enum": ["0.5.0"]
+      "enum": ["0.6.2"]
     },
     "document_id": {
       "type": "string",
@@ -2653,10 +2653,10 @@ For programmatic validation, here is the JSON Schema that validates any `doc2ml-
 
 ## Appendix B: Changelog
 
-| Version | Date       | Changes              |
-| ------- | ---------- | -------------------- |
-| 0.5.0   | 2026-05-04 | Initial pre-release. |
+| Version | Date       | Changes                                                 |
+| ------- | ---------- | ------------------------------------------------------- |
+| 0.6.2   | 2026-05-04 | Added optional Tesseract OCR fallback for scanned PDFs. |
 
 ---
 
-*End of `doc2ml-json` Canonical Schema v0.5.0*
+*End of `doc2ml-json` Canonical Schema v0.6.2*
